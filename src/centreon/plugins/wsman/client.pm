@@ -275,7 +275,7 @@ sub _call {
 # Enumeration (WS-Enumeration with WS-Management extensions)
 
 # Returns an array ref of instances, each one a hash ref of property name =>
-# value, or undef on failure. Values are UTF-8 encoded strings, undef for nil
+# value, or undef on failure. Values are UTF-8 encoded strings, empty for nil
 # values. When a property appears more than once, its last value is kept.
 #  resource_uri: resource to enumerate
 #  query: optional WQL filter
@@ -329,12 +329,9 @@ sub _instance {
     my %instance;
     foreach my $property ($node->childNodes()) {
         next if ($property->nodeType() != XML::LibXML::XML_ELEMENT_NODE());
-        my $nil = $property->getAttributeNS($NS{xsi}, 'nil');
-        if (defined($nil) && $nil eq 'true') {
-            $instance{$property->localname()} = undef;
-            next;
-        }
-        # Complex values (like cim:Datetime) are given as their text content
+        # Complex values (like cim:Datetime) are given as their text content.
+        # Nil values (xsi:nil="true") are empty strings, as with openwsman: the
+        # modes expect defined values.
         my $value = $property->textContent();
         $value = encode('UTF-8', $value) if (utf8::is_utf8($value));
         $instance{$property->localname()} = $value;
