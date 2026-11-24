@@ -598,9 +598,10 @@ sub enumerate {
     my $messageid = MessageID->new();
     my $sid = SessionId->new();
     my $operationid = OperationID->new();
+    my $max_elements = $params{max_elements} || 999;
     my @enumerate = (
         OptimizeEnumeration->new(),
-        MaxElements->new($params{max_elements} || 999),
+        MaxElements->new($max_elements),
     );
     push @enumerate, Filter->new($params{query}) if $params{query};
     my $body = Body->new( Enumerate->new(@enumerate) );
@@ -674,7 +675,8 @@ sub enumerate {
 
         # Reset Body to make Pull request with provided EnumerationContext
         $body->reset(
-            Pull->new( $context )
+            # WinRM requires same MaxElements for Pull as for Enumerate
+            Pull->new( $context, MaxElements->new($max_elements, 'for_pull') )
         );
     }
 
