@@ -31,6 +31,7 @@ use warnings;
 
 use Encode qw(encode);
 use MIME::Base64;
+use Time::HiRes;
 use XML::LibXML;
 use centreon::plugins::wsman::transport;
 
@@ -218,8 +219,14 @@ sub _call {
     $content = encode('UTF-8', $content) if (utf8::is_utf8($content));
 
     $self->log("request:\n" . $content) if ($self->{debug_raw});
+    my $start = Time::HiRes::time();
     my $response = $self->{transport}->post(content => $content);
     $self->{lastcode} = $response->code();
+    $self->log(sprintf(
+        '%s request to %s: HTTP %s (%d bytes in %.2fs)',
+        $options{action}, $self->{url}, $response->status_line(),
+        length($response->content() // ''), Time::HiRes::time() - $start
+    ));
     if ($self->{debug_raw}) {
         my $dump = $response->status_line() . "\n" . $response->headers()->as_string() . "\n" . $response->decoded_content(charset => 'none');
         $self->log("response:\n" . $dump);
@@ -247,6 +254,8 @@ sub _call {
         $reason = $xpc->findvalue('/s:Envelope/s:Body/s:Fault/s:Detail//*[local-name()="Message"]') if ($reason eq '');
         $reason =~ s/^\s+|\s+$//g;
         $reason = encode('UTF-8', $reason) if (utf8::is_utf8($reason));
+        my $subcode = $xpc->findvalue('/s:Envelope/s:Body/s:Fault/s:Code/s:Subcode/s:Value');
+        $self->log("SOAP fault on $options{action} request" . ($subcode ne '' ? ", subcode $subcode" : '') . ($code ne '' ? ", code $code" : ''));
         return $self->_error($reason ne '' ? $reason : 'SOAP fault' . ($code ne '' ? " (code $code)" : ''));
     }
 
@@ -303,14 +312,21 @@ sub enumerate {
         my ($answer) = $xpc->findnodes('/s:Envelope/s:Body/n:EnumerateResponse | /s:Envelope/s:Body/n:PullResponse');
         return $self->_error("Malformed $action response") if (!defined($answer));
 
+        my $received = 0;
         foreach my $items ($xpc->findnodes('w:Items | n:Items', $answer)) {
-            push @instances, _instance($_)
-                foreach (grep { $_->nodeType() == XML::LibXML::XML_ELEMENT_NODE() } $items->childNodes());
+            foreach (grep { $_->nodeType() == XML::LibXML::XML_ELEMENT_NODE() } $items->childNodes()) {
+                push @instances, _instance($_);
+                $received++;
+            }
         }
 
-        last if ($xpc->exists('w:EndOfSequence | n:EndOfSequence', $answer));
+        my $end = $xpc->exists('w:EndOfSequence | n:EndOfSequence', $answer);
         my $context = $xpc->findvalue('n:EnumerationContext', $answer);
-        last if ($context eq '');
+        $self->log(sprintf(
+            '%d instance(s) received (total: %d)%s', $received, scalar(@instances),
+            $end || $context eq '' ? ', end of enumeration' : ', pulling next instances'
+        ));
+        last if ($end || $context eq '');
 
         # Pull next items: MaxElements and MaxEnvelopeSize must not change
         ($doc, $body, $message_id) = $self->_envelope(action => 'pull', resource_uri => $options{resource_uri});
@@ -366,7 +382,11 @@ sub shell_create {
     $id = $xpc->findvalue('/s:Envelope/s:Body//rsp:ShellId') if ($id eq '');
     return $self->_error('No shell id returned') if ($id eq '');
 
-    $self->log("shell $id created");
+    $self->log(
+        "shell $id created on " . $self->{url} .
+        ($options{options} && %{$options{options}} ?
+            ' (' . join(', ', map { "$_=$options{options}->{$_}" } sort keys %{$options{options}}) . ')' : '')
+    );
 
     return { id => $id };
 }
@@ -378,8 +398,7 @@ sub shell_command {
 
     $self->{lasterror} = '';
 
-    my $short = length($options{command}) > 120 ? substr($options{command}, 0, 117) . '...' : $options{command};
-    $self->log("running command: $short");
+    $self->log("running command in shell $options{shell}->{id} on $self->{url}: $options{command}");
 
     my ($doc, $body, $message_id) = $self->_envelope(
         action => 'command',
@@ -395,6 +414,7 @@ sub shell_command {
 
     my $command_id = $xpc->findvalue('/s:Envelope/s:Body/rsp:CommandResponse/rsp:CommandId');
     return $self->_error('No command id returned') if ($command_id eq '');
+    $self->log("command id: $command_id");
 
     return $command_id;
 }
@@ -426,7 +446,10 @@ sub shell_receive {
         my $xpc = $self->_call(document => $doc, message_id => $message_id, action => 'receive');
         if (!defined($xpc)) {
             # No output during OperationTimeout: just ask again
-            next if (defined($self->{fault_code}) && $self->{fault_code} eq FAULT_TIMED_OUT);
+            if (defined($self->{fault_code}) && $self->{fault_code} eq FAULT_TIMED_OUT) {
+                $self->log('no output yet, command still running');
+                next;
+            }
             return undef;
         }
 
@@ -451,7 +474,6 @@ sub shell_receive {
         my $value = $state->getAttribute('State') // '';
         if ($value eq SHELL_NS . '/CommandState/Done') {
             return $self->_error("No exit code for 'done' command") if (!defined($exit_code));
-            $self->log("command exited with code $exit_code");
             last;
         } elsif ($value eq SHELL_NS . '/CommandState/Pending') {
             # WinRM 1.1 ends commands in that state
@@ -459,6 +481,17 @@ sub shell_receive {
         } elsif ($value ne SHELL_NS . '/CommandState/Running') {
             return $self->_error('Unknown command state: ' . $value);
         }
+    }
+
+    if ($self->{debug}) {
+        $self->log(sprintf(
+            'command %s exited with code %s (stdout: %d bytes, stderr: %d bytes)',
+            $command_id, $exit_code // 'unknown', length($output{stdout}), length($output{stderr})
+        ));
+        $self->_log_output(stream => 'stderr', data => $output{stderr});
+        # Output of a failed command usually explains the failure
+        $self->_log_output(stream => 'stdout', data => $output{stdout})
+            if (defined($exit_code) && $exit_code ne '0');
     }
 
     return { stdout => $output{stdout}, stderr => $output{stderr}, exitcode => $exit_code };
@@ -480,8 +513,23 @@ sub shell_signal {
 
     $self->_call(document => $doc, message_id => $message_id, action => 'signal')
         or return undef;
+    $self->log('signal ' . ($options{signal} // 'terminate') . " sent to command $options{command_id}");
 
     return 1;
+}
+
+# Log command output lines (limited to 4000 bytes)
+sub _log_output {
+    my ($self, %options) = @_;
+
+    my $data = $options{data};
+    return if (!defined($data) || $data =~ /^\s*$/);
+
+    my $truncated = length($data) > 4000 ? 1 : 0;
+    $data = substr($data, 0, 4000) if ($truncated);
+    $data =~ s/\r//g;
+    $self->log("$options{stream}: $_") foreach (grep { /\S/ } split(/\n/, $data));
+    $self->log("$options{stream}: [output truncated]") if ($truncated);
 }
 
 sub shell_delete {

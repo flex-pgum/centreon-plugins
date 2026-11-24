@@ -226,7 +226,8 @@ sub tls_server_end_point {
 
     return {
         data => 'tls-server-end-point:' . Digest::SHA->new($algorithm)->add($der)->digest(),
-        digest => $digest
+        digest => $digest,
+        signature => $signature // 'unknown'
     };
 }
 

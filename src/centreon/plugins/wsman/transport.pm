@@ -123,6 +123,15 @@ sub post {
     $request->content($options{content});
 
     my $method = $self->{auth_method};
+    if (!$self->{auth_logged}) {
+        # Once per run
+        $self->{auth_logged} = 1;
+        $self->log(
+            "authentication method '$method'" .
+            ($method =~ /^(?:basic|pass|digest|ntlm)$/ ? " with user '$self->{username}'" : '') .
+            ($self->{proxy} ? ', through proxy' : '')
+        );
+    }
     if ($method eq 'basic' || $method eq 'pass') {
         $request->header(Authorization => 'Basic ' . encode_base64($self->{username} . ':' . $self->{password}, ''));
     }
@@ -202,7 +211,7 @@ sub _ntlm {
 
     my $ntlm = Authen::NTLM->new(user => $user, domain => $domain, password => $self->{password}, version => 2);
 
-    $self->log("ntlm authentication with '$scheme' scheme");
+    $self->log("authentication required, trying ntlm with '$scheme' scheme" . ($domain ne '' ? " for domain '$domain'" : ''));
     $request->header(Authorization => $scheme . ' ' . $ntlm->challenge());
     my $response = $self->_send(request => $request);
 
@@ -242,7 +251,10 @@ sub _kerberos {
                 timeout => $self->{timeout}
             );
             if (defined($binding->{data})) {
-                $self->log('kerberos channel binding with server certificate hashed with ' . $binding->{digest});
+                $self->log(
+                    'kerberos channel binding with server certificate signed with ' . $binding->{signature} .
+                    ' (tls-server-end-point hash: ' . $binding->{digest} . ')'
+                );
                 $negotiate->channel_binding($binding->{data});
             } else {
                 $self->log('kerberos channel binding not used: ' . $binding->{error});
@@ -256,7 +268,7 @@ sub _kerberos {
         return $options{response};
     }
 
-    $self->log('kerberos authentication for service ' . $negotiate->service());
+    $self->log('authentication required, trying kerberos with service ' . $negotiate->service());
     $request->header(Authorization => 'Negotiate ' . $token);
     my $response = $self->_send(request => $request);
     # A token is valid only once
