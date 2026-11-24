@@ -1,6 +1,9 @@
 {
     "dependencies": [
-        "libopenwsman-perl",
+        "libwww-perl",
+        "liblwp-protocol-https-perl",
+        "libxml-libxml-perl",
+        "libauthen-ntlm-perl",
         "libjson-perl",
         "libdatetime-perl"
     ]

@@ -1,6 +1,9 @@
 {
     "dependencies": [
-        "perl(openwsman)",
+        "perl(LWP::UserAgent)",
+        "perl(LWP::Protocol::https)",
+        "perl(XML::LibXML)",
+        "perl(Authen::NTLM)",
         "perl(POSIX)",
         "perl(Time::HiRes)",
         "perl(XML::Simple)"
