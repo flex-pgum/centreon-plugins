@@ -5,6 +5,7 @@
     "files": [
         "centreon/plugins/script_wsman.pm",
         "centreon/plugins/wsman.pm",
+        "centreon/plugins/wsman/",
         "os/windows/wsman/",
         "centreon/common/powershell/functions.pm",
         "centreon/common/powershell/windows/certificates.pm",

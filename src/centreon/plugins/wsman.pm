@@ -22,19 +22,9 @@ package centreon::plugins::wsman;
 
 use strict;
 use warnings;
-use openwsman;
 use MIME::Base64;
+use centreon::plugins::wsman::client;
 
-use constant WS_LASTERR_LOGIN_DENIED => 26;
-
-my %auth_method_map = (
-    noauth       => $openwsman::NO_AUTH_STR,
-    basic        => $openwsman::BASIC_AUTH_STR,
-    digest       => $openwsman::DIGEST_AUTH_STR,
-    pass         => $openwsman::PASS_AUTH_STR,
-    ntlm         => $openwsman::NTLM_AUTH_STR,
-    gssnegotiate => $openwsman::GSSNEGOTIATE_AUTH_STR
-);
 my %debug_level = (
     always => -1,
     none => 0,
@@ -98,36 +88,35 @@ sub connect {
         $self->{output}->option_exit(exit_litteral => 'unknown');
     }
 
+    my ($debug, $debug_raw) = (0, 0);
     if (defined($self->{wsman_params}->{wsman_debug})) {
-        if (!defined($debug_level{ $self->{wsman_params}->{wsman_debug} })) {
-            openwsman::set_debug($debug_level{info});
-        } else {
-            openwsman::set_debug($debug_level{ $self->{wsman_params}->{wsman_debug} });
-        }
+        my $level = defined($debug_level{ $self->{wsman_params}->{wsman_debug} }) ?
+            $debug_level{ $self->{wsman_params}->{wsman_debug} } : $debug_level{info};
+        $debug = $level != 0 ? 1 : 0;
+        # Also dump raw HTTP requests and responses
+        $debug_raw = ($level == $debug_level{debug} || $level == $debug_level{always}) ? 1 : 0;
     }
-    $self->{client} = new openwsman::Client::(
-        $self->{wsman_params}->{host}, $self->{wsman_params}->{wsman_port}, 
-        $self->{wsman_params}->{wsman_path}, $self->{wsman_params}->{wsman_scheme},
-        $self->{wsman_params}->{wsman_username}, $self->{wsman_params}->{wsman_password}
+
+    my $host = $self->{wsman_params}->{host};
+    $host = '[' . $host . ']' if ($host =~ /:/ && $host !~ /^\[/);
+    my $path = $self->{wsman_params}->{wsman_path};
+    $path = '/' . $path if ($path !~ /^\//);
+
+    $self->{client} = centreon::plugins::wsman::client->new(
+        url            => $self->{wsman_params}->{wsman_scheme} . '://' . $host . ':' . $self->{wsman_params}->{wsman_port} . $path,
+        auth_method    => $self->{wsman_params}->{wsman_auth_method},
+        username       => $self->{wsman_params}->{wsman_username},
+        password       => $self->{wsman_params}->{wsman_password},
+        timeout        => $self->{wsman_params}->{wsman_timeout},
+        proxy_url      => $self->{wsman_params}->{wsman_proxy_url},
+        proxy_username => $self->{wsman_params}->{wsman_proxy_username},
+        proxy_password => $self->{wsman_params}->{wsman_proxy_password},
+        debug          => $debug,
+        debug_raw      => $debug_raw
     );
     if (!defined($self->{client})) {
         $self->{output}->add_option_msg(short_msg => 'Could not create client handler');
         $self->{output}->option_exit(exit_litteral => $self->{wsman_errors_exit});
-    }
-
-    if ($self->{wsman_params}->{wsman_scheme} eq 'https') {
-        # Dont verify
-        $self->{client}->transport()->set_verify_peer(0);
-        $self->{client}->transport()->set_verify_host(0);
-    }
-
-    $self->{client}->transport()->set_auth_method($auth_method_map{$self->{wsman_params}->{wsman_auth_method}});
-    $self->{client}->transport()->set_timeout($self->{wsman_params}->{wsman_timeout});
-    if (defined($self->{wsman_params}->{wsman_proxy_url})) {
-        $self->{client}->transport()->set_proxy($self->{wsman_params}->{wsman_proxy_url});
-        if (defined($self->{wsman_params}->{wsman_proxy_username}) && defined($self->{wsman_params}->{wsman_proxy_password})) {
-            $self->{client}->transport()->set_proxyauth($self->{wsman_params}->{wsman_proxy_username} . ':' . $self->{wsman_params}->{wsman_proxy_password});
-        }
     }
 }
 
@@ -139,154 +128,54 @@ sub execute_winshell_commands {
     my ($dont_quit) = (defined($options{dont_quit}) && $options{dont_quit} == 1) ? 1 : 0;
     $self->set_error();
 
-    my $uri = 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/cmd';
-    my $namespace = 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell';
     my $command_result = {};
-    my ($command_id, $client_options, $data, $result, $node);
 
     # Init result
     foreach my $command (@{$options{commands}}) {
         $command_result->{$command->{label}} = {stdout => undef, stderr => undef, exit_code => undef};
     }
 
-    if (!defined($self->{shell_id})) { 
+    if (!defined($self->{shell})) {
         $self->{shell_id} = undef;
-    
+
         ######
         # Start Shell
-        $client_options = new openwsman::ClientOptions::() 
-            or $self->internal_exit(msg => 'Could not create client options handler');
-        $client_options->set_timeout(30 * 1000); # 30sec
-        $client_options->add_selector('Name', 'Themes');
-        $client_options->add_option('WINRS_NOPROFILE', 'FALSE');
-        $client_options->add_option('WINRS_CODEPAGE', '437'); # utf-8
-    
-        $data = new openwsman::XmlDoc::('Shell', $namespace)
-            or $self->internal_exit(msg => 'Could not create XmlDoc');
-        $data->root()->add($namespace, 'InputStreams', 'stdin');
-        $data->root()->add($namespace, 'OutputStreams', 'stdout stderr');
-
-        $result = $self->{client}->create($client_options, $uri, $data->string(), length($data->string()), "utf-8");
-        return undef if ($self->handle_dialog_fault(result => $result, msg => 'Create failed: ', dont_quit => $dont_quit));
-        $node = $result->root()->find(undef, 'Selector')
-            or $self->internal_exit(msg => 'No shell id returned');
-        $self->{shell_id} = $node->text();
+        $self->{shell} = $self->{client}->shell_create(
+            options => {
+                WINRS_NOPROFILE => 'FALSE',
+                WINRS_CODEPAGE => '437'
+            }
+        );
+        return undef if ($self->handle_dialog_fault(result => $self->{shell}, msg => 'Create failed: ', dont_quit => $dont_quit));
+        $self->{shell_id} = $self->{shell}->{id};
     }
-    
+
     foreach my $command (@{$options{commands}}) {
         #######
         # Issue command
-        $client_options = new openwsman::ClientOptions::()
-            or $self->internal_exit(msg => 'Could not create client options handler');
-        $client_options->set_timeout(30 * 1000); # 30sec
-        $client_options->add_option('WINRS_CONSOLEMODE_STDIN', 'TRUE');
-        if (defined($options{skip_cmd})) {
-            $client_options->add_option('WINRS_SKIP_CMD_SHELL', 'TRUE');
-        } else {
-            $client_options->add_option('WINRS_SKIP_CMD_SHELL', 'FALSE');
-        }
-        $client_options->add_selector('ShellId', $self->{shell_id});
-        $data = new openwsman::XmlDoc::('CommandLine', $namespace)
-            or $self->internal_exit(msg => 'Could not create XmlDoc');
-        $data->root()->add($namespace, 'Command', $command->{value});
-        $result = $self->{client}->invoke(
-            $client_options, $uri, 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Command',
-            $data
+        my $command_id = $self->{client}->shell_command(
+            shell => $self->{shell},
+            command => $command->{value},
+            options => {
+                WINRS_CONSOLEMODE_STDIN => 'TRUE',
+                WINRS_SKIP_CMD_SHELL => defined($options{skip_cmd}) ? 'TRUE' : 'FALSE'
+            }
         );
-        return undef if ($self->handle_dialog_fault(result => $result, msg => 'Invoke failed: ', dont_quit => $dont_quit));
-
-        $node = $result->root()->find(undef, 'CommandId')
-            or $self->internal_exit(msg => 'No command id returned');
-        $command_id = $node->text();
+        return undef if ($self->handle_dialog_fault(result => $command_id, msg => 'Invoke failed: ', dont_quit => $dont_quit));
 
         #######
         # Request stdout/stderr
-        $client_options = new openwsman::ClientOptions::()
-            or $self->internal_exit(msg => 'Could not create client options handler');
-        $client_options->set_timeout(30 * 1000); # 30sec
-        $client_options->add_selector('ShellId', $self->{shell_id});
+        my $result = $self->{client}->shell_receive(
+            shell => $self->{shell},
+            command_id => $command_id
+        );
+        return undef if ($self->handle_dialog_fault(result => $result, msg => 'Invoke failed: ', dont_quit => $dont_quit));
 
-        $data = new openwsman::XmlDoc::('Receive', $namespace);
-        $node = $data->root()->add($namespace, 'DesiredStream', 'stdout stderr')
-            or $self->internal_exit(msg => 'Could not create XmlDoc');
-        $node->attr_add(undef, 'CommandId', $command_id);
-
-        my $timeout_global = 30; #seconds
-        my $wait_timeout_done = 0;
-        my $loop_out = 1;
-        my ($current_stdout, $current_stderr) = ('', '');
-
-        while ($loop_out == 1 && $wait_timeout_done < $timeout_global) {
-            $result = $self->{client}->invoke(
-                $client_options, $uri, 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Receive',
-                $data
-            );
-            return undef if ($self->handle_dialog_fault(result => $result, msg => 'Invoke failed: ', dont_quit => $dont_quit));
-            my $response = $result->root()->find($namespace, 'ReceiveResponse')
-                or $self->internal_exit(msg => 'No ReceiveResponse');
-            ######
-            # Parsing Reponse
-            for (my $cnt = 0; $cnt < $response->size(); $cnt++) {
-                my $node = $response->get($cnt);
-                my $node_command = $node->attr_find(undef, 'CommandId')
-                    or $self->internal_exit(msg => 'No CommandId in ReceiveResponse');
-                if ($node_command->value() ne $command_id) {
-                    $self->internal_exit(msg => 'Wrong CommandId in ReceiveResponse node');
-                }
-
-                if ($node->name() eq 'Stream') {
-                    my $node_tmp = $node->attr_find(undef, 'Name');
-                    if (!defined($node_tmp)) {
-                        next;
-                    }
-                    my $stream_type = $node_tmp->value();
-                    my $output = decode_base64($node->text());
-                    next if (!defined($output) || $output eq '');
-
-                    if ($stream_type eq 'stderr') {
-                        $current_stderr .= $output;
-                    }
-                    if ($stream_type eq 'stdout') {
-                        $current_stdout .= $output;
-                    }
-                }
-                if ($node->name() eq 'CommandState') {
-                    my $node_tmp = $node->attr_find(undef, 'State');
-                    if (!defined($node_tmp)) {
-                        next;
-                    }
-                    my $state = $node_tmp->value();
-                    if ($state eq 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done') {
-                        my $exit_code = $node->find(undef, 'ExitCode');
-                        if (defined($exit_code)) {
-                            $command_result->{$command->{label}}->{exit_code} = $exit_code->text();
-                        } else {
-                            $self->internal_exit(msg => "No exit code for 'done' command");
-                        }
-                        $loop_out = 0;
-                    } elsif ($state eq 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Running') {
-                        # we wait
-                        $wait_timeout_done += 3;
-                        sleep 3;
-                    } elsif ($state eq 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Pending') {
-                       # no-op
-                       # WinRM 1.1 sends this with ExitCode:0
-                       $loop_out = 0;
-                    } else {
-                        # unknown
-                        $self->internal_exit(msg => 'Unknown command state: ' . $state);
-                    }
-                }
-            }
-        }
-
-        if ($loop_out == 1) {
-            $self->internal_exit(msg => 'Command to long to execute...');
-        }
-
+        my ($current_stdout, $current_stderr) = ($result->{stdout}, $result->{stderr});
         $current_stderr =~ s/\r//mg;
         $current_stdout =~ s/\r//mg;
 
+        $command_result->{$command->{label}}->{exit_code} = $result->{exitcode};
         $command_result->{$command->{label}}->{stderr} = $current_stderr if ($current_stderr ne '');
         $command_result->{$command->{label}}->{stdout} = $current_stdout if ($current_stdout ne '');
 
@@ -295,28 +184,23 @@ sub execute_winshell_commands {
         #
         # not strictly needed for WinRM 2.0, but WinRM 1.1 requires this
         #
-        $data = new openwsman::XmlDoc::('Signal', $namespace)
-            or $self->internal_exit(msg => 'Could not create XmlDoc');
-        $data->root()->attr_add(undef, 'CommandId', $command_id);
-        $data->root()->add($namespace, 'Code', 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/signal/terminate');
-        $result = $self->{client}->invoke(
-            $client_options, $uri, 'http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Signal',
-            $data
+        $result = $self->{client}->shell_signal(
+            shell => $self->{shell},
+            command_id => $command_id,
+            signal => 'terminate'
         );
         return undef if ($self->handle_dialog_fault(result => $result, msg => 'Invoke failed: ', dont_quit => $dont_quit));
     }
 
     # Delete Shell resource
-    if (defined($self->{shell_id}) && !(defined($options{keep_open}) && $options{keep_open} == 1)) {
-        my $client_options = new openwsman::ClientOptions::()
-            or die print "[ERROR] Could not create client options handler.\n";
-        $client_options->set_timeout(30 * 1000); # 30sec
-        $client_options->add_selector('ShellId', $self->{shell_id});
+    if (defined($self->{shell}) && !(defined($options{keep_open}) && $options{keep_open} == 1)) {
+        my $shell = $self->{shell};
+        $self->{shell} = undef;
         $self->{shell_id} = undef;
-        $result = $self->{client}->invoke($client_options, $uri, 'http://schemas.xmlsoap.org/ws/2004/09/transfer/Delete', undef);
+        my $result = $self->{client}->shell_delete(shell => $shell);
         return undef if ($self->handle_dialog_fault(result => $result, msg => 'Invoke failed: ', dont_quit => $dont_quit));
     }
-    
+
     return $command_result;
 }
 
@@ -406,25 +290,12 @@ sub request {
     }
 
     ######
-    # ClientOptions object
-    my $client_options = new openwsman::ClientOptions::() 
-        or $self->internal_exit(msg => 'Could not create client options handler');
-
-    # Optimization
-    $client_options->set_flags($openwsman::FLAG_ENUMERATION_OPTIMIZATION);
-    $client_options->set_max_elements(999);
-    
-    ######
-    # Filter/Enumerate
-    my $filter;
-    if (defined($options{wql_filter})) {
-        $filter = new openwsman::Filter::()
-            or $self->internal_exit(msg => 'Could not create filter');
-        $filter->wql($options{wql_filter});
-    }
-
-    my $result = $self->{client}->enumerate($client_options, $filter, $options{uri});
-    return undef if ($self->handle_dialog_fault(result => $result, msg => 'Could not enumerate instances: ', dont_quit => $dont_quit));
+    # Filter/Enumerate (with pull of all the results)
+    my $rows = $self->{client}->enumerate(
+        resource_uri => $options{uri},
+        query => $options{wql_filter}
+    );
+    return undef if ($self->handle_dialog_fault(result => $rows, msg => 'Could not enumerate instances: ', dont_quit => $dont_quit));
 
     ######
     # Fetch values
@@ -432,35 +303,17 @@ sub request {
 
     $array_return = [] if ($result_type eq 'array');
     $hash_return = {} if ($result_type eq 'hash');
-    my $context;
     my $total = 0;
 
-    while (1) {
-        my $nodes = $result->body()->find(undef, "Items");
-
-        # Get items.
-        my $items;
-        for (my $cnt = 0; defined($nodes) && ($cnt<$nodes->size()); $cnt++) {
-            my $row_return = {};
-            for (my $cnt2 = 0; ($cnt2<$nodes->get($cnt)->size()); $cnt2++) {
-                $row_return->{$nodes->get($cnt)->get($cnt2)->name()} = $nodes->get($cnt)->get($cnt2)->text();
-            }
-            $total++;
-            push @{$array_return}, $row_return if ($result_type eq 'array');
-            $hash_return->{$row_return->{$options{hash_key}}} = $row_return if ($result_type eq 'hash');
-        }
-
-        $context = $result->context() or last;
-        $result = $self->{client}->pull($client_options, $filter, $options{uri}, $context)
-            or last;
+    foreach my $row_return (@$rows) {
+        $total++;
+        push @{$array_return}, $row_return if ($result_type eq 'array');
+        $hash_return->{$row_return->{$options{hash_key}}} = $row_return if ($result_type eq 'hash');
     }
-
-    # Release context.
-    $self->{client}->release($client_options, $options{uri}, $context) if($context);
 
     if ($nothing_quit == 1 && $total == 0) {
         $self->{output}->add_option_msg(short_msg => "Cant get a single value.");
-        $self->{output}->option_exit(exit_litteral => $self->{option_results}->{wsman_errors_exit});
+        $self->{output}->option_exit(exit_litteral => $self->{wsman_errors_exit});
     }
 
     if ($result_type eq 'array') {
@@ -472,7 +325,7 @@ sub request {
 sub check_options {
     my ($self, %options) = @_;
     # $options{option_results} = ref to options result
-    
+
     $self->{wsman_errors_exit} = $options{option_results}->{wsman_errors_exit};
 
     if (!defined($options{option_results}->{host})) {
@@ -485,8 +338,8 @@ sub check_options {
 
     $self->{wsman_params}->{wsman_auth_method} = $options{option_results}->{wsman_auth_method};
 
-    $self->{wsman_params}->{wsman_port} = $options{option_results}->{wsman_port};    
-    
+    $self->{wsman_params}->{wsman_port} = $options{option_results}->{wsman_port};
+
     $self->{wsman_params}->{wsman_path} = $options{option_results}->{wsman_path};
     $self->{wsman_params}->{wsman_username} = $options{option_results}->{wsman_username};
     $self->{wsman_params}->{wsman_password} = $options{option_results}->{wsman_password};
@@ -502,10 +355,11 @@ sub handle_dialog_fault {
     my $result = $options{result};
     my $prefix = $options{msg} // 'Error: ';
 
-    unless($result && $result->is_fault eq 0) {
+    unless ($result) {
         my $error_msg;
-        if ($self->{wsman_params}->{wsman_auth_method} eq 'gssnegotiate' && $self->{client}->last_error() == WS_LASTERR_LOGIN_DENIED) {
-            $error_msg = qq~Failed to authenticate using 'gssnegotiate'.
+        my $fault_string = $self->{client}->lasterror();
+        if ($self->{wsman_params}->{wsman_auth_method} eq 'gssnegotiate' && $self->{client}->lastcode() == 401) {
+            $error_msg = qq~Failed to authenticate using 'gssnegotiate' ($fault_string).
 Please verify that:
 - a valid Kerberos ticket is available on the machine running the plugin (check with the 'klist' command),
 - the target host name is correct,
@@ -513,15 +367,7 @@ Please verify that:
 Use the debug option for more details.
 ~;
         } else {
-            my $fault_string = $self->{client}->fault_string();
-            $error_msg = $prefix . ((defined($fault_string)) ? $fault_string : 'use the debug option for more details');
-            # Try to display XML fault response in debug mode
-            if (defined($result) && defined($self->{wsman_params}->{wsman_debug})) {
-                my $fault_detail = eval { $result->root()->string() };
-                if (defined($fault_detail) && $fault_detail ne '') {
-                    $error_msg .= "\nFault details:\n" . $fault_detail;
-                }
-            }
+            $error_msg = $prefix . ((defined($fault_string) && $fault_string ne '') ? $fault_string : 'use the debug option for more details');
         }
 
         if ($options{dont_quit} == 1) {
@@ -588,7 +434,8 @@ WSMAN class
 
 =head1 WSMAN OPTIONS
 
-Need at least OpenWSMAN-perl version >= 2.4.0
+Pure perl WS-Management implementation (OpenWSMAN is not required anymore).
+Authentication method C<ntlm> requires the Authen::NTLM perl module and C<gssnegotiate> requires the GSSAPI perl module.
 
 =over 8
 
@@ -622,7 +469,8 @@ Define the HTTP transport timeout in seconds (default: 30).
 
 =item B<--wsman-auth-method>
 
-Define the authentication method. Available methods: C<noauth>, C<basic> (default), C<pass>, C<digest>, C<ntlm>, C<gssnegotiate>.
+Define the authentication method. Available methods: C<noauth>, C<basic> (default), C<pass> (same as C<basic>), C<digest>, C<ntlm>, C<gssnegotiate>.
+With C<gssnegotiate> (Kerberos), a valid ticket must be available (see C<kinit>) and the hostname must be the FQDN of the target.
 
 =item B<--wsman-proxy-url>
 
@@ -638,7 +486,7 @@ Define the password to authenticate to the proxy server.
 
 =item B<--wsman-debug>
 
-Define the OpenWSMAN log level. Available levels: error, critical, warning, message, info (default), debug.
+Define the WSMAN log level (messages are printed on standard error). Available levels: error, critical, warning, message, info (default), debug (also dumps HTTP requests and responses).
 
 =item B<--wsman-errors-exit>
 

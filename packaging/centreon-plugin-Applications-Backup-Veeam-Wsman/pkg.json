@@ -5,6 +5,7 @@
     "files": [
         "centreon/plugins/script_wsman.pm",
         "centreon/plugins/wsman.pm",
+        "centreon/plugins/wsman/",
         "apps/backup/veeam/wsman/",
         "centreon/common/powershell/functions.pm",
         "centreon/common/powershell/veeam/"
